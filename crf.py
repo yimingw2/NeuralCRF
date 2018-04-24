@@ -19,11 +19,11 @@ class ProcessData():
 		:param:
 		:return words:
 		"""
-		train_x_raw, train_y_raw, train_vocab = self._load_data(self.train_data_path)
-		dev_x_raw, dev_y_raw, dev_vocab = self._load_data(self.dev_data_path)
+		train_x_raw, train_y_raw, train_vocab, self.train_sent = self._load_data(self.train_data_path)
+		dev_x_raw, dev_y_raw, dev_vocab, self.dev_sent = self._load_data(self.dev_data_path)
 		self.vocab = train_vocab.union(dev_vocab)
 		self.vocab.add("<unk>")
-		self.vocab2idx, self.label2idx = self._build_vocab2idx()
+		self.vocab2idx, self.label2idx, self.idx2vocab, self.idx2label = self._build_vocab_idx()
 		self.train_x, self.train_y, self.train_max_length = self._build_data_index(train_x_raw, train_y_raw)
 		self.dev_x, self.dev_y, self.dev_max_length = self._build_data_index(dev_x_raw, dev_y_raw)
 
@@ -39,42 +39,51 @@ class ProcessData():
 		vocab = set()
 		words = list()
 		labels = list()
+		sent_nolabel = list()
 
 		with open(data_path) as train_data:
 			f = iter(train_data)
 			word_x = list()
 			label_y = list()
+			sent_nolabel_i = list()
 			for line in f:
 				if line == "\n":
 					words.append(word_x)
 					labels.append(label_y)
+					sent_nolabel.append(sent_nolabel_i)
 					word_x = list()
 					label_y = list()
+					sent_nolabel_i = list()
 				else:
 					parts = line.split()
 					vocab.add(parts[0])
 					word_x.append(parts[0])
 					label_y.append(parts[3])
-		return words, labels, vocab
+					sent_nolabel_i.append(" ".join([parts[0], parts[1], parts[2], parts[3]]))
+		return words, labels, vocab, sent_nolabel
 
 
-	def _build_vocab2idx(self):
+	def _build_vocab_idx(self):
 		"""
 		build vocabulary to index from a vocabulary list
 		:param vocab: vocabulary list
 		:return vocab2idx: a dictionary from single word to index
 		"""
 		vocab2idx = dict()
+		idx2vocab = dict()
 		self.vocab = sorted(list(self.vocab))
 		for i, item in enumerate(self.vocab):
 			vocab2idx[item] = i + 1
+			idx2vocab[i+1] = item
 
 		label2idx = dict()
+		idx2label = dict()
 		self.label = sorted(self.label)
 		for i, item in enumerate(self.label):
 			label2idx[item] = i
+			idx2label[i] = item
 
-		return vocab2idx, label2idx
+		return vocab2idx, label2idx, idx2vocab, idx2label
 
 
 	def _build_data_index(self, data_x_raw, data_y_raw):
@@ -137,10 +146,10 @@ class NeuralCRF():
 		if use_crf:
 			self._crf()
 			self.loss = self._crf_loss()
-			self.accuracy = self._crf_accuracy()
+			self.accuracy, self.decode_seq = self._crf_accuracy()
 		else: # only with bi-lstm
 			self.loss = self._bilstm_loss()
-			self.accuracy = self._bilstm_accuracy()
+			self.accuracy, self.decode_seq = self._bilstm_accuracy()
 		self.train_op = self._train()
 
 
@@ -221,12 +230,13 @@ class NeuralCRF():
 		:param: None
 		:return accuracy:
 		"""
-		incorrect_num = tf.count_nonzero(self.label_raw - tf.argmax(self.output_softmax, axis=2, output_type=tf.int32), dtype=tf.int32)
+		decode_seq = tf.argmax(self.output_softmax, axis=2, output_type=tf.int32)
+		incorrect_num = tf.count_nonzero(self.label_raw - decode_seq, dtype=tf.int32)
 		incorrect_num = tf.cast(incorrect_num, dtype=tf.float32)
 		total_num = tf.cast(tf.reduce_sum(self.input_length), dtype=tf.float32)
 		correct_num = total_num - incorrect_num
 		accuracy = correct_num / total_num
-		return accuracy
+		return accuracy, decode_seq
 
 
 	def _crf_loss(self):
@@ -245,16 +255,6 @@ class NeuralCRF():
 		:param: None
 		:return accuracy:
 		"""
-		# #### TODO: this should only be used at test time, and the batch size should be 1 ####
-		# self.score_nobatch = tf.squeeze(input=self.lstm_outputs_with_start_end, axis=0)
-		# decode_seq, _ = tf.contrib.crf.viterbi_decode(score=score_nobatch, transition_params=self.transition)
-		# label_nobatch = tf.squeeze(input=self.label_raw, axis=0)
-		# incorrect_num = tf.count_nonzero(self.label_nobatch - decode_seq, dtype=tf.int32)
-		# total_num = tf.cast(tf.reduce_sum(self.input_length), dtype=tf.float32)
-		# correct_num = total_num - incorrect_num
-		# # accuracy = correct_num / total_num
-		# return correct_num, total_num
-
 		decode_seq, _ = tf.contrib.crf.crf_decode(potentials=self.lstm_outputs_with_start_end, \
 												  transition_params=self.transition, \
 												  sequence_length=self.input_length)
@@ -263,7 +263,7 @@ class NeuralCRF():
 		total_num = tf.cast(tf.reduce_sum(self.input_length), dtype=tf.float32)
 		correct_num = total_num - incorrect_num
 		accuracy = correct_num / total_num
-		return accuracy
+		return accuracy, decode_seq
 
 
 	def _train(self):
@@ -279,11 +279,12 @@ class NeuralCRF():
 
 class TrainModel():
 
-	def __init__(self, dataset, params, sess):
+	def __init__(self, dataset, params, sess, output_path):
 
 		self.sess = sess
 		self.dataset = dataset
 		self.params = params
+		self.output_path = output_path
 		self.model = NeuralCRF(dataset.vocab, dataset.label, params["embed_dim"], params["bilstm_hidden_dim"], params["batch_size"], params["learning_rate"], params["use_crf"])
 		self.init = tf.global_variables_initializer()
 
@@ -350,6 +351,35 @@ class TrainModel():
 			loss, acc = self.sess.run(fetches=[self.model.loss, self.model.accuracy], \
 					 	  			  feed_dict={self.model.input_raw: self.dev_x, self.model.label_raw: self.dev_y})
 			print("testing, loss: {}, accuracy: {}".format(loss, acc))
+		decode_seq = self.sess.run(fetches=self.model.decode_seq, feed_dict={self.model.input_raw: self.dev_x, self.model.label_raw: self.dev_y})
+		self._output_decode_seq(decode_seq)
+
+
+	def _output_decode_seq(self, decode_seq):
+
+		idx2label = self.dataset.idx2label
+		dev_sent = self.dataset.dev_sent
+		label_size = len(self.dataset.label)
+		start_idx = label_size
+		end_idx = label_size + 1
+		with open(self.output_path,'w') as output_f:
+			idx = 0
+			for i in range(len(dev_sent)):
+				sent = dev_sent[i]
+				seq = decode_seq[i].tolist()
+				for j in range(len(sent)):
+					if self.params["use_crf"]:
+						if seq[j+1] in idx2label:
+							label = idx2label[seq[j+1]]
+						else:
+							if j == start_idx:
+								label = "<START>"
+							else:
+								label = "<END>"	
+					else:
+						label = idx2label[seq[j]]
+					output_f.write("{} {}\n".format(sent[j], label))
+				output_f.write("\n")
 
 	
 
@@ -358,6 +388,7 @@ def parse_arguments():
 	parser = argparse.ArgumentParser(description="Neural CRF")
 	parser.add_argument('--train-data', dest='train_data_path', default='train.data', type=str)
 	parser.add_argument('--test-data', dest='test_data_path', default='dev.data', type=str)
+	parser.add_argument('--output-path', dest='output_path', default='yimingw2-dev-lstm.data.out', type=str)
 
 	return parser.parse_args()
 
@@ -365,7 +396,7 @@ def parse_arguments():
 def training_params():
 
 	params = dict()
-	params["use_crf"] = True
+	params["use_crf"] = False
 	params["embed_dim"] = 50
 	params["bilstm_hidden_dim"] = 300
 	params["batch_size"] = 32
@@ -379,12 +410,13 @@ def main():
 	args = parse_arguments()
 	train_data_path = args.train_data_path
 	test_data_path = args.test_data_path
+	output_path = args.output_path
 
 	dataset = ProcessData(train_data_path, test_data_path)
 	params = training_params()
 	sess = tf.Session()
 
-	train_obj = TrainModel(dataset, params, sess)
+	train_obj = TrainModel(dataset, params, sess, output_path)
 	train_obj.train()
 
 
