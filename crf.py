@@ -28,7 +28,6 @@ class ProcessData():
 		self.dev_x, self.dev_y, self.dev_max_length = self._build_data_index(dev_x_raw, dev_y_raw)
 
 
-
 	def _load_data(self, data_path):
 		"""
 		load training data
@@ -117,7 +116,7 @@ class NeuralCRF():
 	:return :
 	"""
 
-	def __init__(self, vocab_list, label_list, embed_dim, bilstm_hidden_dim, batch_size, learning_rate):
+	def __init__(self, vocab_list, label_list, embed_dim, bilstm_hidden_dim, batch_size, learning_rate, use_crf):
 
 		# vocabulary and label list
 		self.vocab_list = vocab_list
@@ -133,14 +132,19 @@ class NeuralCRF():
 		# set up the initializer
 		self.initializer = tf.contrib.layers.xavier_initializer()
 		# build the network
-		self._build_model()
+		self._build_model(use_crf)
 		# get loss and train_op
-		self.loss = self._loss()
+		if use_crf:
+			self._crf()
+			self.loss = self._crf_loss()
+			self.accuracy = self._crf_accuracy()
+		else: # only with bi-lstm
+			self.loss = self._bilstm_loss()
+			self.accuracy = self._bilstm_accuracy()
 		self.train_op = self._train()
-		self.accuracy = self._accuracy()
 
 
-	def _build_model(self):
+	def _build_model(self, use_crf):
 		"""
 		build model
 		:param:
@@ -148,7 +152,11 @@ class NeuralCRF():
 		"""
 		with tf.variable_scope("neural-crf"):
 			# build embedding and input and one-hot target label
-			embedding_nobias = tf.get_variable(name="embedding", shape=[len(self.vocab_list)+1, self.embed_dim], dtype=tf.float32, initializer=self.initializer) # +1 is for 0 index
+			if use_crf:
+				emb = len(self.vocab_list) + 3
+			else:
+				emb = len(self.vocab_list) + 1 
+			embedding_nobias = tf.get_variable(name="embedding", shape=[emb, self.embed_dim], dtype=tf.float32, initializer=self.initializer) # +1 is for 0 index
 			zero_bias = tf.zeros([1, self.embed_dim], dtype=tf.float32)
 			self.embedding = tf.concat([zero_bias, embedding_nobias], axis=0)
 			self.input = tf.nn.embedding_lookup(params=self.embedding, ids=self.input_raw)
@@ -156,13 +164,10 @@ class NeuralCRF():
 			# build input sequence length
 			count_nonzero = tf.count_nonzero(self.input, axis=2)
 			self.input_length = tf.cast(tf.count_nonzero(count_nonzero, axis=1), dtype=tf.int32) # [batch_size,]
-			# build bi-lstm model
-			self.lstm_outputs = self._bilstm_model()
-			# softmax layer
-			self.output_softmax = tf.nn.softmax(self.lstm_outputs, axis=2)
+			self._bilstm()
 
 
-	def _bilstm_model(self):
+	def _bilstm(self):
 		"""
 		define bi-lstm model
 		:param:
@@ -175,23 +180,90 @@ class NeuralCRF():
 					bilstm_cell[direction] = tf.contrib.rnn.LSTMCell(self.bilstm_hidden_dim, initializer=self.initializer)
 			outputs, _ = tf.nn.bidirectional_dynamic_rnn(cell_fw=bilstm_cell["f"], cell_bw=bilstm_cell["b"], \
 														 inputs=self.input, sequence_length=self.input_length, dtype=tf.float32)
-			outputs = tf.concat(outputs, 2)
-			lstm_outputs = tf.contrib.layers.fully_connected(outputs, len(self.label_list), activation_fn=None)
-		return lstm_outputs
+			self.outputs = tf.concat(outputs, 2)
 
 
-	def _loss(self):
+	def _crf(self):
 		"""
-		calciulate loss
+		define bi-lstm-crf model
+		:param:
+		:return crf_outputs: [batch_size, max_time, label_size]
+		"""
+		with tf.variable_scope("crf"):
+			self.transition = tf.get_variable(name="transition", shape=[len(self.label_list)+2, len(self.label_list)+2], \
+											  dtype=tf.float32, initializer=self.initializer) # +2 for <s> and <\s>
+			self.lstm_outputs_with_start_end = tf.contrib.layers.fully_connected(self.outputs, len(self.label_list)+2, activation_fn=None)
+			self.crf_log_likelihood, _ = tf.contrib.crf.crf_log_likelihood(inputs=self.lstm_outputs_with_start_end, \
+																	  tag_indices=self.label_raw, \
+																	  sequence_lengths=self.input_length, \
+																	  transition_params=self.transition)
+
+
+	def _bilstm_loss(self):
+		"""
+		calculate bi-lstm loss
 		:param: None
 		:return loss:
 		"""
+		lstm_outputs = tf.contrib.layers.fully_connected(self.outputs, len(self.label_list), activation_fn=None)
+		self.output_softmax = tf.nn.softmax(lstm_outputs, axis=2) # softmax layer
 		label_temp = tf.cast(self.label, dtype=tf.float32)
 		cross_entropy_total = -tf.reduce_sum(label_temp * tf.log(self.output_softmax), axis=2)
 		label_length_temp = tf.cast(self.input_length, dtype=tf.float32)
 		cross_entropy = tf.reduce_sum(cross_entropy_total, axis=1) / label_length_temp
 		loss = tf.reduce_mean(cross_entropy)
 		return loss
+
+
+	def _bilstm_accuracy(self):
+		"""
+		calculate bi-lstm accuracy
+		:param: None
+		:return accuracy:
+		"""
+		incorrect_num = tf.count_nonzero(self.label_raw - tf.argmax(self.output_softmax, axis=2, output_type=tf.int32), dtype=tf.int32)
+		incorrect_num = tf.cast(incorrect_num, dtype=tf.float32)
+		total_num = tf.cast(tf.reduce_sum(self.input_length), dtype=tf.float32)
+		correct_num = total_num - incorrect_num
+		accuracy = correct_num / total_num
+		return accuracy
+
+
+	def _crf_loss(self):
+		"""
+		calculate crf loss
+		:param: None
+		:return loss:
+		"""
+		loss = -tf.reduce_mean(self.crf_log_likelihood)
+		return loss
+
+
+	def _crf_accuracy(self):
+		"""
+		calculate crf accuracy
+		:param: None
+		:return accuracy:
+		"""
+		# #### TODO: this should only be used at test time, and the batch size should be 1 ####
+		# self.score_nobatch = tf.squeeze(input=self.lstm_outputs_with_start_end, axis=0)
+		# decode_seq, _ = tf.contrib.crf.viterbi_decode(score=score_nobatch, transition_params=self.transition)
+		# label_nobatch = tf.squeeze(input=self.label_raw, axis=0)
+		# incorrect_num = tf.count_nonzero(self.label_nobatch - decode_seq, dtype=tf.int32)
+		# total_num = tf.cast(tf.reduce_sum(self.input_length), dtype=tf.float32)
+		# correct_num = total_num - incorrect_num
+		# # accuracy = correct_num / total_num
+		# return correct_num, total_num
+
+		decode_seq, _ = tf.contrib.crf.crf_decode(potentials=self.lstm_outputs_with_start_end, \
+												  transition_params=self.transition, \
+												  sequence_length=self.input_length)
+		incorrect_num = tf.count_nonzero(self.label_raw - decode_seq, dtype=tf.int32)
+		incorrect_num = tf.cast(incorrect_num, dtype=tf.float32)
+		total_num = tf.cast(tf.reduce_sum(self.input_length), dtype=tf.float32)
+		correct_num = total_num - incorrect_num
+		accuracy = correct_num / total_num
+		return accuracy
 
 
 	def _train(self):
@@ -204,20 +276,6 @@ class NeuralCRF():
 		return train_op
 
 
-	def _accuracy(self):
-		"""
-		calculate accuracy
-		:param: None
-		:return accuracy:
-		"""
-		incorrect_num = tf.count_nonzero(self.label_raw - tf.argmax(self.output_softmax, axis=2, output_type=tf.int32), dtype=tf.int32)
-		incorrect_num = tf.cast(incorrect_num, dtype=tf.float32)
-		total_num = tf.cast(tf.reduce_sum(self.input_length), dtype=tf.float32)
-		correct_num = total_num - incorrect_num
-		accuracy = correct_num / total_num
-		return accuracy
-
-
 
 class TrainModel():
 
@@ -226,25 +284,37 @@ class TrainModel():
 		self.sess = sess
 		self.dataset = dataset
 		self.params = params
-		self.model = NeuralCRF(dataset.vocab, dataset.label, params["embed_dim"], params["bilstm_hidden_dim"], params["batch_size"], params["learning_rate"])
+		self.model = NeuralCRF(dataset.vocab, dataset.label, params["embed_dim"], params["bilstm_hidden_dim"], params["batch_size"], params["learning_rate"], params["use_crf"])
 		self.init = tf.global_variables_initializer()
 
-		self.train_x, self.train_y = self._pad_data(dataset.train_x, dataset.train_y, dataset.train_max_length)
-		self.dev_x, self.dev_y = self._pad_data(dataset.dev_x, dataset.dev_y, dataset.dev_max_length)
+		self.train_x, self.train_y = self._pad_data(dataset.train_x, dataset.train_y, dataset.train_max_length, params["use_crf"])
+		self.dev_x, self.dev_y = self._pad_data(dataset.dev_x, dataset.dev_y, dataset.dev_max_length, params["use_crf"])
 
 
-	def _pad_data(self, data_x, data_y, max_length):
+	def _pad_data(self, data_x, data_y, max_length, use_crf):
 
 		data_x_new = list()
 		data_y_new = list()
+		if use_crf:
+			max_length += 2
+			sent_start_idx = len(self.dataset.vocab) + 1
+			sent_end_idx = len(self.dataset.vocab) + 2
+			label_start_idx = len(self.dataset.label)
+			label_end_idx = len(self.dataset.label) + 1
+
 		for i, sent in enumerate(data_x):
 			if len(sent) == max_length:
 				data_x_new.append(np.array(sent))
 				data_y_new.append(np.array(data_y[i]))
 			else:
 				pad_num = max_length - len(sent)
-				data_x_new.append(np.concatenate([np.array(sent), np.zeros([pad_num,])]))
-				data_y_new.append(np.concatenate([np.array(data_y[i]), np.zeros([pad_num,])]))
+				if use_crf:
+					pad_num -= 2
+					data_x_new.append(np.concatenate([np.array([sent_start_idx]), np.array(sent), np.array([sent_end_idx]), np.zeros([pad_num,])]))
+					data_y_new.append(np.concatenate([np.array([label_start_idx]), np.array(data_y[i]), np.array([label_end_idx]), np.zeros([pad_num,])]))
+				else:
+					data_x_new.append(np.concatenate([np.array(sent), np.zeros([pad_num,])]))
+					data_y_new.append(np.concatenate([np.array(data_y[i]), np.zeros([pad_num,])]))
 		data_x_new = np.reshape(np.concatenate(np.array(data_x_new)), [len(data_x_new), -1])
 		data_y_new = np.reshape(np.concatenate(np.array(data_y_new)), [len(data_y_new), -1])
 
@@ -274,11 +344,11 @@ class TrainModel():
 				train_sent_feed = train_sent[j*sz:min((j+1)*sz, l)]
 				train_label_feed = train_label[j*sz:min((j+1)*sz, l)]
 				_, loss, acc = self.sess.run(fetches=[self.model.train_op, self.model.loss, self.model.accuracy], \
-													  feed_dict={self.model.input_raw: train_sent_feed, self.model.label_raw: train_label_feed})
+											 feed_dict={self.model.input_raw: train_sent_feed, self.model.label_raw: train_label_feed})
 				if j % 50 == 0:	
 					print("Training epoch {}, batch: {}, loss: {}, accuracy: {}".format(i, j, loss, acc))
 			loss, acc = self.sess.run(fetches=[self.model.loss, self.model.accuracy], \
-					 	  feed_dict={self.model.input_raw: self.dev_x, self.model.label_raw: self.dev_y})
+					 	  			  feed_dict={self.model.input_raw: self.dev_x, self.model.label_raw: self.dev_y})
 			print("testing, loss: {}, accuracy: {}".format(loss, acc))
 
 	
@@ -295,11 +365,12 @@ def parse_arguments():
 def training_params():
 
 	params = dict()
+	params["use_crf"] = True
 	params["embed_dim"] = 50
 	params["bilstm_hidden_dim"] = 300
 	params["batch_size"] = 32
 	params["learning_rate"] = 1e-2
-	params["epoch"] = 10
+	params["epoch"] = 4
 
 	return params
 
